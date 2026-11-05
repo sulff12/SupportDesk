@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SupportDesk</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f4f6fa; color: #202736; font: 16px system-ui, sans-serif; }
+    main { max-width: 900px; margin: 36px auto; padding: 0 16px; }
+    h1 { margin-bottom: 4px; } h2 { font-size: 21px; }
+    section { background: white; padding: 22px; border-radius: 12px; margin: 18px 0; border: 1px solid #dce1eb; }
+    label { display: block; margin: 12px 0; }
+    input, textarea, button { font: inherit; }
+    input, textarea { display: block; width: 100%; padding: 10px; border: 1px solid #bac3d3; border-radius: 6px; margin-top: 6px; }
+    textarea { min-height: 90px; resize: vertical; }
+    button { background: #2459d3; color: white; border: none; padding: 10px 16px; border-radius: 6px; cursor: pointer; margin: 4px 4px 4px 0; }
+    button:disabled { opacity: .5; cursor: wait; }
+    button.secondary { background: #e9edf5; color: #202736; }
+    .muted { color: #596579; } #notice { white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; background: #e8edf7; border-radius: 6px; }
+    #notice.error { background: #ffe6e6; color: #912323; }
+    .ticket { display: block; width: 100%; text-align: left; background: #edf2fc; color: #202736; }
+    .comment { border-bottom: 1px solid #e4e8f0; padding: 12px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    #detail-description { white-space: pre-wrap; overflow-wrap: anywhere; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>SupportDesk</h1>
+  <p class="muted">Обращения в техническую поддержку</p>
+  <p id="notice" role="status" aria-live="polite">Интерфейс готов. Для регистрации и обращений нужен запущенный backend.</p>
+
+  <section>
+    <h2>Подключение к API</h2>
+    <label>Адрес backend <input id="api-url" type="url" value="http://127.0.0.1:8000" required></label>
+    <p class="muted">Пока backend не написан, запросы будут завершаться ошибкой. Открывать страницу лучше через локальный HTTP-сервер.</p>
+  </section>
+
+  <section id="auth-panel">
+    <h2>Вход и регистрация</h2>
+    <form id="auth-form">
+      <label>Email <input id="email" type="email" autocomplete="username" required></label>
+      <label>Пароль <input id="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit">Войти</button>
+      <button type="button" id="register" class="secondary">Зарегистрироваться</button>
+    </form>
+  </section>
+
+  <div id="workspace" hidden>
+    <button type="button" id="logout" class="secondary">Выйти</button>
+    <section>
+      <h2>Новое обращение</h2>
+      <form id="ticket-form">
+        <label>Название <input id="title" required maxlength="200"></label>
+        <label>Описание <textarea id="description" required></textarea></label>
+        <button type="submit">Отправить обращение</button>
+      </form>
+    </section>
+    <section>
+      <h2>Обращения</h2>
+      <button type="button" id="refresh" class="secondary">Обновить список</button>
+      <div id="ticket-list"></div>
+    </section>
+    <section id="detail" hidden>
+      <h2 id="detail-title"></h2>
+      <p id="detail-status" class="muted"></p>
+      <p id="detail-description"></p>
+      <h3>Комментарии</h3>
+      <div id="comment-list"></div>
+      <form id="comment-form">
+        <label>Сообщение <textarea id="comment-text" required></textarea></label>
+        <button type="submit">Добавить комментарий</button>
+      </form>
+    </section>
+  </div>
+</main>
+<script>
+  // Учебный контракт API. Формат ответов приведён ниже; под него будем писать backend.
+  // POST /auth/register: JSON {email, password} -> 2xx
+  // POST /auth/login: JSON {email, password} -> {access_token: "..."}
+  // GET /tickets -> [{id, title, description, status}, ...]
+  // POST /tickets: JSON {title, description} -> 2xx
+  // GET /tickets/{id} -> {id, title, description, status}
+  // GET /tickets/{id}/comments -> [{id, text, author_id}, ...]
+  // POST /tickets/{id}/comments: JSON {text} -> 2xx
+  // Авторизованные запросы: Authorization: Bearer <access_token>
+  // Токен хранится только в памяти: после обновления страницы нужно войти снова.
+  const $ = id => document.getElementById(id);
+  let token = null;
+  let selectedTicket = null;
+  let busy = false;
+
+  function notice(message, error = false) {
+    $('notice').textContent = message;
+    $('notice').classList.toggle('error', error);
+  }
+
+  function clearSession() {
+    token = null;
+    selectedTicket = null;
+    $('workspace').hidden = true;
+    $('auth-panel').hidden = false;
+    $('detail').hidden = true;
+    $('ticket-list').replaceChildren();
+    $('comment-list').replaceChildren();
+    $('ticket-form').reset();
+    $('comment-form').reset();
+  }
+
+  async function api(path, method = 'GET', body) {
+    const base = $('api-url').value.trim().replace(/\/+$/, '');
+    const url = new URL(base);
+    if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Укажите HTTP или HTTPS адрес API.');
+    const headers = { Accept: 'application/json' };
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    if (token) headers.Authorization = 'Bearer ' + token;
+    let response;
+    try {
+      response = await fetch(base + path, {
+        method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+        signal: AbortSignal.timeout(15000)
+      });
+    } catch {
+      throw new Error('API недоступен: проверь запуск backend, адрес и настройки CORS.');
+    }
+    const raw = await response.text();
+    let data;
+    try { data = raw ? JSON.parse(raw) : null; }
+    catch { throw new Error('API вернул ответ не в формате JSON.'); }
+    if (!response.ok) {
+      if (response.status === 401 && token) clearSession();
+      const detail = data?.detail ?? data;
+      throw new Error('HTTP ' + response.status + ': ' + (typeof detail === 'string' ? detail : JSON.stringify(detail)));
+    }
+    return data;
+  }
+
+  // Блокируем повторные действия, пока запрос не завершился.
+  async function run(action) {
+    if (busy) return;
+    busy = true;
+    document.querySelectorAll('button').forEach(b => b.disabled = true);
+    $('api-url').disabled = true;
+    notice('Выполняется запрос…');
+    try { await action(); }
+    catch (error) { notice(error.message, true); }
+    finally {
+      busy = false;
+      document.querySelectorAll('button').forEach(b => b.disabled = false);
+      $('api-url').disabled = Boolean(token);
+    }
+  }
+
+  async function loadTickets() {
+    const tickets = await api('/tickets');
+    if (!Array.isArray(tickets)) throw new Error('Ожидается массив обращений от GET /tickets.');
+    $('ticket-list').replaceChildren();
+    if (!tickets.length) $('ticket-list').textContent = 'Обращений пока нет.';
+    for (const ticket of tickets) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'ticket';
+      button.textContent = '#' + ticket.id + ' · ' + ticket.title + ' · ' + ticket.status;
+      button.onclick = () => run(() => openTicket(ticket.id));
+      $('ticket-list').append(button);
+    }
+  }
+
+  async function openTicket(id) {
+    selectedTicket = null;
+    $('detail').hidden = true;
+    const path = '/tickets/' + encodeURIComponent(id);
+    const ticket = await api(path);
+    const comments = await api(path + '/comments');
+    if (!Array.isArray(comments)) throw new Error('Ожидается массив комментариев.');
+    selectedTicket = id;
+    $('detail-title').textContent = '#' + ticket.id + ' · ' + ticket.title;
+    $('detail-status').textContent = 'Статус: ' + ticket.status;
+    $('detail-description').textContent = ticket.description;
+    $('comment-list').replaceChildren();
+    if (!comments.length) $('comment-list').textContent = 'Комментариев пока нет.';
+    for (const comment of comments) {
+      const p = document.createElement('p');
+      p.className = 'comment';
+      p.textContent = 'Пользователь #' + comment.author_id + ': ' + comment.text;
+      $('comment-list').append(p);
+    }
+    $('detail').hidden = false;
+    notice('Обращение загружено.');
+  }
+
+  $('auth-form').onsubmit = event => {
+    event.preventDefault();
+    run(async () => {
+      const data = await api('/auth/login', 'POST', { email: $('email').value.trim(), password: $('password').value });
+      if (!data || typeof data.access_token !== 'string' || !data.access_token) throw new Error('В ответе входа отсутствует access_token.');
+      token = data.access_token;
+      $('password').value = '';
+      $('auth-panel').hidden = true;
+      $('workspace').hidden = false;
+      notice('Вход выполнен.');
+      await loadTickets();
+    });
+  };
+  $('register').onclick = () => {
+    if (!$('auth-form').reportValidity()) return;
+    run(async () => {
+      await api('/auth/register', 'POST', { email: $('email').value.trim(), password: $('password').value });
+      $('password').value = '';
+      notice('Регистрация выполнена. Теперь введите пароль и войдите.');
+    });
+  };
+  $('ticket-form').onsubmit = event => {
+    event.preventDefault();
+    run(async () => {
+      const title = $('title').value.trim();
+      const description = $('description').value.trim();
+      if (!title || !description) throw new Error('Заполните название и описание.');
+      await api('/tickets', 'POST', { title, description });
+      $('ticket-form').reset();
+      notice('Обращение создано.');
+      await loadTickets();
+    });
+  };
+  $('comment-form').onsubmit = event => {
+    event.preventDefault();
+    run(async () => {
+      if (selectedTicket === null) throw new Error('Выберите обращение.');
+      const text = $('comment-text').value.trim();
+      if (!text) throw new Error('Введите текст комментария.');
+      const id = selectedTicket;
+      await api('/tickets/' + encodeURIComponent(id) + '/comments', 'POST', { text });
+      $('comment-form').reset();
+      await openTicket(id);
+    });
+  };
+  $('refresh').onclick = () => run(async () => { await loadTickets(); notice('Список обновлён.'); });
+  $('logout').onclick = () => { clearSession(); $('api-url').disabled = false; notice('Вы вышли из аккаунта.'); };
+</script>
+</body>
+</html>
